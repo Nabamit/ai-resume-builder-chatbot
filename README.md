@@ -20,6 +20,8 @@ A conversational resume builder. Instead of filling a long form, the user **talk
 ## 2. Features
 
 - ✅ Two modes: **Create New CV** / **Modify Existing CV**
+- ✅ **AI parse check:** after upload, the bot shows what it understood from the CV and asks the user to confirm or fix it
+- ✅ **Experience level question:** Fresher / 1–2 years / 2–5 years, with company questions for experienced users
 - ✅ Chat interface with quick-reply buttons (`Done`, `Add more`, `Skip`)
 - ✅ Two question types: **Basic (structured)** and **AI-generated (smart)**
 - ✅ Auto-generated: key skills, project key points, achievements, professional summary
@@ -37,9 +39,15 @@ flowchart TD
     A[Landing Page] --> B{Choose Mode}
     B -->|New CV| C[Ask Job Role]
     B -->|Modify Existing CV| D[Upload CV PDF]
-    C --> E[Chatbot Q&A Flow]
-    D --> D1[Parse CV to JSON]
-    D1 --> D2[Ask New Job Role + Job Description]
+    C --> C1{Experience Level}
+    C1 -->|Fresher| E[Chatbot Q&A Flow]
+    C1 -->|1-2 yrs / 2-5 yrs| C2[Work Experience Questions] --> E
+    D --> D1[AI Parse CV to JSON]
+    D1 --> P[Parse Check:<br/>show extracted data, user confirms or fixes]
+    P --> X{Experience Level}
+    X -->|Fresher| D2
+    X -->|1-2 yrs / 2-5 yrs| XC[Ask about companies found on CV]
+    XC --> D2[Ask New Job Role + Job Description]
     D2 --> D3[Gap Analysis: CV vs JD]
     D3 --> D4[Chatbot asks gap-based questions]
     E --> F[Build Resume JSON]
@@ -61,6 +69,19 @@ flowchart TD
 ### Step 0: Job Role
 Bot: *"Which job role are you targeting?"* (e.g., Data Analyst, MIS Executive, Full-Stack Developer)
 The role is stored and used to steer every later AI question and generation.
+
+### Step 0.5: Experience Level
+Bot: *"What is your experience level?"* with buttons:
+
+| Button | Meaning | Next |
+|---|---|---|
+| **Fresher** | Student / recent graduate, up to ~1 year | Skip work-experience section, focus on education, projects, internships |
+| **1–2 years** | Early-career professional | Ask work-experience questions (below) |
+| **2–5 years** | Mid-level professional | Ask work-experience questions (below) + ownership/impact questions |
+
+The level changes resume layout and ordering:
+- **Fresher:** Education and Projects first
+- **Experienced:** Summary, then Work Experience first, then Skills, Projects, Education
 
 ### Step 1: Personal Details (Basic questions)
 Name, city/address, phone, email, LinkedIn, GitHub, portfolio.
@@ -130,12 +151,52 @@ sequenceDiagram
     BE-->>FE: Preview + ATS score
 ```
 
+### 5.1 AI Parse Check (before anything else)
+
+Parsing can be wrong (multi-column layouts, tables, scanned PDFs), so the bot never trusts it blindly.
+
+1. AI converts the uploaded CV into Resume JSON.
+2. Bot shows a **"Here is what I understood"** card per section (personal, education, skills, projects, experience, certificates).
+3. Each card has `Looks correct` / `Edit` buttons.
+4. Parser also returns a **confidence score per section**; low-confidence or empty sections are flagged: *"I couldn't find your CV's skills section. Want to add it?"*
+5. Checks run automatically: missing contact info, broken dates (e.g., end date before start date), duplicate entries, invalid links.
+6. Only after the user confirms does the flow continue.
+
+```
+Parse → Validate (rules) → Confidence check (AI) → User confirms → Continue
+```
+
+### 5.2 Experience Level + Company Questions
+
+After the parse check, the bot asks: *"How would you apply?"*
+
+| Button | Behaviour |
+|---|---|
+| **Fresher** | No company questions. Focus on projects, internships, skills |
+| **1–2 years** | Company questions below |
+| **2–5 years** | Company questions below + deeper impact questions |
+
+**If the user is experienced, the bot reads the company names already found on the CV and asks about each one:**
+
+- *"I found you worked at **{company}** as **{title}** ({from} – {to}). Is this correct?"*
+- *"What were your main responsibilities there?"*
+- *"Any achievement with numbers (revenue, time saved, users, team size)?"*
+- *"Which tools or technologies did you use there?"*
+- *"Does this company's role match the new job role? If yes, what should be highlighted?"*
+- For 2–5 years: *"Did you lead or mentor anyone? Did you own any project end to end?"*
+- If **no company is found** on the CV but the user says they are experienced: *"I couldn't find any company on the CV. Please enter company name, role, and duration."*
+
+AI then rewrites each company's bullets for the new job role/JD (using only the facts the user gave).
+
+### 5.3 Gap analysis
+
 **Gap analysis checks**
 1. Required skills in JD that are missing from the CV
 2. Projects that don't show relevant tools/results
 3. Missing sections (certificates, internship, links)
 4. Weak/unmeasurable bullets
 5. Keywords in JD not present in the CV
+6. Experience years on the CV vs the experience asked in the JD (e.g., JD asks 2–5 years, CV shows 1 year)
 
 **Example gap questions** (Data Analyst JD asks for Tableau + stakeholder reporting):
 - "The JD asks for stakeholder reporting. Did you present dashboards to anyone?"
@@ -155,12 +216,14 @@ sequenceDiagram
 ### Conversation state machine
 
 ```
-START → MODE_SELECT → ROLE → PERSONAL → EDUCATION(loop) → SKILLS
-      → KEY_SKILLS(auto) → PROJECTS(loop) → INTERNSHIP(loop) → CERTS(loop)
+START → MODE_SELECT → ROLE → EXPERIENCE_LEVEL → PERSONAL → EDUCATION(loop) → SKILLS
+      → KEY_SKILLS(auto) → PROJECTS(loop) → WORK_EXPERIENCE(loop, only if experienced) → INTERNSHIP(loop) → CERTS(loop)
       → ACHIEVEMENTS(auto if empty) → SUMMARY(auto) → TEMPLATE → PREVIEW → PDF → ATS
 ```
 
 Each state has: `prompt`, `validator`, `next`, and optional `ai_followup`.
+Modify mode: `UPLOAD → PARSE → PARSE_CHECK → EXPERIENCE_LEVEL → COMPANY_QUESTIONS(loop, if experienced) → JD_INPUT → GAP_QUESTIONS → REWRITE → TEMPLATE → PREVIEW → PDF → ATS`
+
 Basic states are **code-driven** (reliable, cheap); only generation and gap questions call the LLM.
 
 ### UI components
@@ -177,6 +240,7 @@ Basic states are **code-driven** (reliable, cheap); only generation and gap ques
 ```json
 {
   "jobRole": "Data Analyst",
+  "experienceLevel": "fresher | 1-2 | 2-5",
   "personal": {
     "name": "", "location": "", "phone": "", "email": "",
     "linkedin": "", "github": "", "portfolio": ""
@@ -193,11 +257,16 @@ Basic states are **code-driven** (reliable, cheap); only generation and gap ques
     { "title": "", "techStack": [], "from": "", "to": "", "link": "",
       "bullets": [] }
   ],
+  "workExperience": [
+    { "company": "", "title": "", "location": "", "from": "", "to": "", "current": false,
+      "bullets": [], "techUsed": [], "confirmedByUser": false }
+  ],
   "internships": [ { "title": "", "company": "", "from": "", "to": "", "link": "" } ],
   "certificates": [ { "name": "", "issuer": "", "link": "" } ],
   "achievements": [],
   "languages": [ { "name": "", "level": "" } ],
-  "template": "classic"
+  "template": "classic",
+  "parseMeta": { "confidence": { "personal": 0.95, "education": 0.9, "experience": 0.6 }, "confirmed": false }
 }
 ```
 
@@ -213,7 +282,9 @@ Basic states are **code-driven** (reliable, cheap); only generation and gap ques
 | Project bullets | title, stack, user notes | 3–4 action-verb bullets |
 | Achievements | projects, certs, internships | 2–3 factual lines |
 | Summary | whole resume JSON + role | 3–4 line intro |
-| CV parsing | PDF text | Resume JSON |
+| CV parsing | PDF text | Resume JSON + per-section confidence |
+| Parse check | Resume JSON | Issues list (missing / suspicious fields) |
+| Work experience bullets | company, role, user answers, JD | 3–5 impact bullets |
 | Gap analysis | resume JSON + JD | gaps + questions |
 
 ### Prompt rules (important)
@@ -244,7 +315,9 @@ Score out of **100**, computed mostly by deterministic rules (+ LLM for relevanc
 | Measurable impact | 15 | Bullets with numbers / % / counts |
 | Formatting & parsability | 15 | Single column, standard headings, selectable text, no images/tables for core text |
 | Contact & links | 10 | Email, phone, LinkedIn, GitHub valid |
-| Length & readability | 10 | 1 page (fresher), bullet length, no spelling errors |
+| Length & readability | 10 | 1 page (fresher) / 1–2 pages (2–5 yrs), bullet length, no spelling errors |
+
+For **experienced** users, the *Measurable impact* check is weighted on Work Experience bullets; for **freshers** it is weighted on Projects.
 
 **Output shown to user**
 - Score ring (e.g., 82/100)
@@ -286,6 +359,7 @@ Templates are **HTML/CSS components** that take the Resume JSON, so adding a tem
 | POST | `/api/session` | Start session (mode: new / modify) |
 | POST | `/api/chat` | Send user message, get next bot question |
 | POST | `/api/resume/parse` | Upload PDF → Resume JSON |
+| POST | `/api/resume/parse-check` | Validate parsed JSON, return issues + confidence per section |
 | POST | `/api/resume/gap-analysis` | Resume + JD → gaps & questions |
 | POST | `/api/ai/generate` | Summary / key skills / bullets / achievements |
 | POST | `/api/resume/pdf` | Resume JSON + template → PDF |
@@ -323,6 +397,9 @@ ai-resume-builder-chatbot/
 
 - User skips a section → omit it, don't leave empty headings
 - Fresher with no internship/achievements → AI generates achievements from real data only
+- Parsed company names look wrong or duplicated → show them in the parse check and let the user edit before asking questions
+- User selects Fresher but the CV shows full-time jobs (or the opposite) → bot points out the mismatch and asks which one to use
+- Experience level overlaps (e.g., exactly 2 years) → let the user choose; the bot never decides silently
 - Scanned/image PDF upload → OCR fallback or ask user to re-upload
 - LLM returns invalid JSON → retry once, then fall back to manual input
 - Never store phone/email in logs; allow users to delete their resumes
@@ -337,7 +414,7 @@ ai-resume-builder-chatbot/
 | **MVP (Week 1–2)** | Mode A chat flow, basic questions, Classic template, PDF export |
 | **Phase 2 (Week 3)** | AI generation: key skills, project bullets, summary, achievements |
 | **Phase 3 (Week 4)** | ATS score + suggestions |
-| **Phase 4 (Week 5)** | Mode B: upload, parse, JD gap analysis |
+| **Phase 4 (Week 5)** | Mode B: upload, AI parse + parse check, experience level, company questions, JD gap analysis |
 | **Phase 5** | Multiple templates, auth, saved resumes, versioning |
 | **Future** | Cover letter generator, LinkedIn import, mock-interview questions from the CV |
 
